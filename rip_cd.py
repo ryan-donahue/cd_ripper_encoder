@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 import musicbrainzngs
 import requests
 
-BASE = Path("/~/music_rips")
 
 FLAC_DIR = BASE / "FLAC"
 ALAC_DIR = BASE / "ALAC"
