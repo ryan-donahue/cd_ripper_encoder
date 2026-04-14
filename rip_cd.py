@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import musicbrainzngs
 import requests
 
+BASE = Path("~/music_rips")
 
 FLAC_DIR = BASE / "FLAC"
 ALAC_DIR = BASE / "ALAC"
@@ -19,8 +20,8 @@ musicbrainzngs.set_useragent("cd_ripper", "1.0", "you@example.com")
 # Helpers
 # ---------------------------
 
-def run(cmd):
-    subprocess.run(cmd, check=True)
+def run(cmd, **kwargs):
+    subprocess.run(cmd, check=True, **kwargs)
 
 # ---------------------------
 # Step 1: Rip CD
