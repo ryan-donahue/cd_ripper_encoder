@@ -3,18 +3,32 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import musicbrainzngs
 import requests
+import json
 
-BASE = Path("~/music_rips")
+# ---------------------------
+# Paths
+# ---------------------------
+
+BASE = Path.home() / "music_rips"
 
 FLAC_DIR = BASE / "FLAC"
 ALAC_DIR = BASE / "ALAC"
 AAC_DIR = BASE / "AAC"
 WAV_DIR = BASE / "temp_wav"
+CACHE_DIR = BASE / "metadata_cache"
 
-for d in [FLAC_DIR, ALAC_DIR, AAC_DIR, WAV_DIR]:
+for d in [FLAC_DIR, ALAC_DIR, AAC_DIR, WAV_DIR, CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-musicbrainzngs.set_useragent("cd_ripper", "1.0", "you@example.com")
+# ---------------------------
+# MusicBrainz setup
+# ---------------------------
+
+musicbrainzngs.set_useragent(
+    "cd_ripper",
+    "1.0",
+    "you@example.com"
+)
 
 # ---------------------------
 # Helpers
@@ -24,63 +38,179 @@ def run(cmd, **kwargs):
     subprocess.run(cmd, check=True, **kwargs)
 
 # ---------------------------
-# Step 1: Rip CD
+# Cache system
+# ---------------------------
+
+def cache_path(discid):
+    return CACHE_DIR / f"{discid}.json"
+
+def load_cache(discid):
+    path = cache_path(discid)
+    if path.exists():
+        with open(path, "r") as f:
+            return json.load(f)
+    return None
+
+def save_cache(discid, data):
+    path = cache_path(discid)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ---------------------------
+# Rip CD
 # ---------------------------
 
 def rip_cd():
     print("Ripping CD...")
-    run(["cdparanoia", "-Z", "-B"], cwd=WAV_DIR)
+    run(["cdparanoia", "-B", "-Z"], cwd=WAV_DIR)
 
 # ---------------------------
-# Step 2: Metadata
-# ---------------------------
-
-def get_cd_metadata():
-
-    discid_output = subprocess.check_output(["cd-discid"]).decode()
-    discid = discid_output.split()[0]
-
-    data = musicbrainzngs.get_releases_by_discid(
-        discid,
-        includes=["recordings", "artists"]
-    )
-
-    release = data["disc"]["release-list"][0]
-
-    artist = release["artist-credit"][0]["artist"]["name"]
-    album = release["title"]
-    year = release["date"][:4]
-
-    mediums = release["medium-list"]
-
-    # detect which disc we're ripping
-    medium = mediums[0]
-    disc_number = int(medium["position"])
-    disc_total = len(mediums)
-
-    tracks = [t["recording"]["title"] for t in medium["track-list"]]
-
-    return artist, album, year, disc_number, disc_total, tracks, release["id"]
-
-# ---------------------------
-# Step 3: Cover Art
+# Cover art
 # ---------------------------
 
 def download_cover(release_id):
-
     url = f"https://coverartarchive.org/release/{release_id}/front"
     path = WAV_DIR / "cover.jpg"
 
     r = requests.get(url)
-
     if r.status_code == 200:
-        with open(path, "wb") as f:
-            f.write(r.content)
+        path.write_bytes(r.content)
+        return path
 
-    return path
+    return None
 
 # ---------------------------
-# Encoding Functions
+# Release selection
+# ---------------------------
+
+def choose_release(releases):
+
+    print("\nMultiple releases found:\n")
+
+    for i, r in enumerate(releases, start=1):
+        artist = r["artist-credit"][0]["artist"]["name"]
+        title = r["title"]
+        date = r.get("date", "????")
+        country = r.get("country", "??")
+
+        print(f"{i}) {artist} - {title} ({date}) [{country}]")
+
+    while True:
+        choice = input("\nSelect release number: ")
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(releases):
+                return releases[idx]
+        print("Invalid choice.")
+
+# ---------------------------
+# Metadata lookup (with cache)
+# ---------------------------
+
+def get_cd_metadata():
+
+    print("Reading disc ID...")
+
+    result = subprocess.check_output(["cd-discid"]).decode().strip()
+    parts = result.split()
+
+    discid = parts[0]
+
+    wav_files = sorted(WAV_DIR.glob("*.wav"))
+    track_total = len(wav_files)
+
+    # -----------------------
+    # Check cache first
+    # -----------------------
+    cached = load_cache(discid)
+    if cached:
+        print("Loaded metadata from cache.")
+
+        return (
+            cached["artist"],
+            cached["album"],
+            cached["year"],
+            1,
+            1,
+            cached["tracks"],
+            None
+        )
+
+    releases = []
+
+    # -----------------------
+    # MusicBrainz lookup
+    # -----------------------
+    try:
+        data = musicbrainzngs.get_releases_by_discid(
+            discid,
+            includes=["recordings", "artists"]
+        )
+        releases = data.get("disc", {}).get("release-list", [])
+    except Exception as e:
+        print("Disc ID lookup failed:", e)
+
+    # fallback search (safe usage)
+    if not releases:
+        print("Falling back to search...")
+        try:
+            data = musicbrainzngs.search_releases(limit=10)
+            releases = data.get("release-list", [])
+        except Exception as e:
+            print("Search failed:", e)
+
+    # -----------------------
+    # Manual fallback (and cache it)
+    # -----------------------
+    if not releases:
+        print("\nNo metadata found. Enter manually.\n")
+
+        artist = input("Artist: ")
+        album = input("Album: ")
+        year = input("Year: ")
+
+        tracks = []
+        for i in range(track_total):
+            tracks.append(input(f"Track {i+1}: "))
+
+        save_cache(discid, {
+            "artist": artist,
+            "album": album,
+            "year": year,
+            "tracks": tracks
+        })
+
+        return artist, album, year, 1, 1, tracks, None
+
+    # -----------------------
+    # Choose release
+    # -----------------------
+    release = releases[0] if len(releases) == 1 else choose_release(releases)
+
+    artist = release["artist-credit"][0]["artist"]["name"]
+    album = release["title"]
+    year = release.get("date", "0000")[:4]
+    release_id = release["id"]
+
+    full = musicbrainzngs.get_release_by_id(
+        release_id,
+        includes=["recordings"]
+    )
+
+    mediums = full["release"]["medium-list"]
+    medium = mediums[0]
+
+    disc_number = int(medium.get("position", 1))
+    disc_total = len(mediums)
+
+    tracks = [t["recording"]["title"] for t in medium["track-list"]]
+
+    print(f"\nSelected: {artist} - {album} ({year})\n")
+
+    return artist, album, year, disc_number, disc_total, tracks, release_id
+
+# ---------------------------
+# Encoding
 # ---------------------------
 
 def encode_flac(wav, out, cover, meta):
@@ -88,14 +218,15 @@ def encode_flac(wav, out, cover, meta):
     cmd = [
         "ffmpeg","-y",
         "-i", str(wav),
-        "-i", str(cover),
-        "-map","0:a",
-        "-map","1",
         "-c:a","flac",
         "-compression_level","8",
-        "-threads","0",
-        "-disposition:v","attached_pic"
+        "-threads","0"
     ]
+
+    if cover:
+        cmd.insert(2, "-i")
+        cmd.insert(3, str(cover))
+        cmd += ["-map","0:a","-map","1","-disposition:v","attached_pic"]
 
     for k,v in meta.items():
         cmd += ["-metadata", f"{k}={v}"]
@@ -134,13 +265,12 @@ def encode_aac(wav, out, meta):
 # ---------------------------
 
 def apply_replaygain(folder):
-    subprocess.run(
-        f"metaflac --add-replay-gain {folder}/*.flac",
-        shell=True
-    )
+    flacs = list(folder.glob("*.flac"))
+    if flacs:
+        run(["metaflac", "--add-replay-gain", *map(str, flacs)])
 
 # ---------------------------
-# Main Processing
+# Processing
 # ---------------------------
 
 def process_album(artist, album, year, disc_number, disc_total, tracks, cover):
@@ -154,11 +284,12 @@ def process_album(artist, album, year, disc_number, disc_total, tracks, cover):
     for p in [flac_path, alac_path, aac_path]:
         p.mkdir(parents=True, exist_ok=True)
 
-    track_total = len(tracks)
+    wav_files = sorted(WAV_DIR.glob("*.wav"))
+    track_total = len(wav_files)
 
-    for i, title in enumerate(tracks, start=1):
+    for i, wav in enumerate(wav_files, start=1):
 
-        wav = WAV_DIR / f"track{i:02}.cdda.wav"
+        title = tracks[i - 1] if i - 1 < len(tracks) else f"Track {i}"
 
         filename = f"d{disc_number:02} - t{i:02} {title} ({year})"
 
@@ -172,34 +303,15 @@ def process_album(artist, album, year, disc_number, disc_total, tracks, cover):
             "date": year
         }
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-
-            executor.submit(
-                encode_flac,
-                wav,
-                flac_path / f"{filename}.flac",
-                cover,
-                meta
-            )
-
-            executor.submit(
-                encode_alac,
-                wav,
-                alac_path / f"{filename}.m4a",
-                meta
-            )
-
-            executor.submit(
-                encode_aac,
-                wav,
-                aac_path / f"{filename}.m4a",
-                meta
-            )
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            ex.submit(encode_flac, wav, flac_path / f"{filename}.flac", cover, meta)
+            ex.submit(encode_alac, wav, alac_path / f"{filename}.m4a", meta)
+            ex.submit(encode_aac, wav, aac_path / f"{filename}.m4a", meta)
 
     apply_replaygain(flac_path)
 
 # ---------------------------
-# Run
+# Main
 # ---------------------------
 
 if __name__ == "__main__":
@@ -208,7 +320,7 @@ if __name__ == "__main__":
 
     artist, album, year, disc_number, disc_total, tracks, release_id = get_cd_metadata()
 
-    cover = download_cover(release_id)
+    cover = download_cover(release_id) if release_id else None
 
     process_album(
         artist,
